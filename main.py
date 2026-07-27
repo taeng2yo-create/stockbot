@@ -2,16 +2,16 @@ import os
 import urllib.parse
 import urllib.request
 import feedparser
-import google.generativeai as genai
+from google import genai
 
 # 환경변수 가져오기
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 
 
 def fetch_latest_news():
-  """구글 뉴스 RSS를 통해 미 증시 및 국증시 관련 핵심 뉴스 수집"""
+  """구글 뉴스 RSS를 통해 미 증시 및 한국 증시 관련 핵심 뉴스 수집"""
   rss_url = "https://news.google.com/rss/search?q=%EB%AF%B8%EA%B5%AD%EC%A6%9D%EC%8B%9C+%ED%95%9C%EA%B5%AD%EC%A6%9D%EC%8B%9C&hl=ko&gl=KR&ceid=KR:ko"
   feed = feedparser.parse(rss_url)
   headlines = []
@@ -22,8 +22,13 @@ def fetch_latest_news():
 
 def generate_briefing(news_data):
   """Gemini API를 활용해 모닝 브리핑 원고 생성"""
-  genai.configure(api_key=GEMINI_API_KEY)
-  model = genai.GenerativeModel("gemini-1.5-flash")
+  if not API_KEY:
+    raise ValueError(
+        "API 키가 설정되지 않았습니다. GitHub Secrets의 GEMINI_API_KEY를"
+        " 확인해 주세요."
+    )
+
+  client = genai.Client(api_key=API_KEY)
 
   prompt = f"""
     너는 최고 수준의 수석 증권 분석가야.
@@ -40,7 +45,11 @@ def generate_briefing(news_data):
     - 텔레그램으로 읽기 쉽고 명확하며 모바일 보기 좋게 가독성을 맞춰서 정리해줘.
     - 너무 길지 않게 핵심 위주로 작성해줘.
     """
-  response = model.generate_content(prompt)
+
+  response = client.models.generate_content(
+      model="gemini-2.5-flash",
+      contents=prompt,
+  )
   return response.text
 
 
