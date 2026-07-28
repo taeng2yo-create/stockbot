@@ -55,11 +55,10 @@ def generate_briefing(news_data):
 
 def send_telegram_message(text):
   """텔레그램으로 메세지 전송"""
-  # Gemini가 생성한 ** 굵은 글씨(마크다운 표준)를 텔레그램 레거시 마크다운(*)으로 변환
   text = text.replace("**", "*")
   url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
   data = urllib.parse.urlencode(
-      {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+      {"chat_id": TELEGRAM_CHAT_ID, "text": text}  # parse_mode 제거
   ).encode("utf-8")
   req = urllib.request.Request(url, data=data)
   urllib.request.urlopen(req)
