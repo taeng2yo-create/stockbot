@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -32,36 +33,68 @@ def check_env():
 
 
 # ------------------------------------------------------------
-# 뉴스 수집
+# 뉴스 수집 (제목 + 링크)
 # ------------------------------------------------------------
-def _fetch_rss_headlines(query, max_items=6):
-    """구글 뉴스 RSS에서 헤드라인만 뽑아온다"""
+def _fetch_rss_items(rss_url, max_items=6):
+    """RSS 피드에서 (제목, 링크) 쌍을 뽑아온다"""
+    feed = feedparser.parse(rss_url)
+    items = []
+    for entry in feed.entries[:max_items]:
+        title = getattr(entry, "title", "").strip()
+        link = getattr(entry, "link", "").strip()
+        if title and link:
+            items.append({"title": title, "link": link})
+    return items
+
+
+def _google_news_rss(query, max_items=6):
     rss_url = (
         "https://news.google.com/rss/search?q="
         + urllib.parse.quote(query)
         + "&hl=ko&gl=KR&ceid=KR:ko"
     )
-    feed = feedparser.parse(rss_url)
-    headlines = []
-    for entry in feed.entries[:max_items]:
-        title = getattr(entry, "title", "").strip()
-        if title:
-            headlines.append(f"- {title}")
-    return headlines
+    return _fetch_rss_items(rss_url, max_items=max_items)
+
+
+def _yahoo_finance_rss(max_items=6):
+    # Yahoo Finance 주요 뉴스 RSS
+    rss_url = "https://finance.yahoo.com/news/rssindex"
+    return _fetch_rss_items(rss_url, max_items=max_items)
 
 
 def fetch_latest_news():
-    """미국 증시 + 한국 증시 관련 최신 헤드라인 수집"""
-    us_headlines = _fetch_rss_headlines("미국증시 나스닥 다우존스 S&P500", max_items=6)
-    kr_headlines = _fetch_rss_headlines("한국증시 코스피 코스닥", max_items=6)
+    """미국 증시 + 한국 증시 관련 최신 뉴스(제목+링크) 수집"""
+    us_google = _google_news_rss("미국증시 나스닥 다우존스 S&P500", max_items=4)
+    us_yahoo = _yahoo_finance_rss(max_items=4)
+    kr_google = _google_news_rss("한국증시 코스피 코스닥", max_items=6)
 
+    # 중복 제목 제거
+    def dedupe(items):
+        seen = set()
+        result = []
+        for it in items:
+            key = it["title"]
+            if key not in seen:
+                seen.add(key)
+                result.append(it)
+        return result
+
+    us_items = dedupe(us_google + us_yahoo)
+    kr_items = dedupe(kr_google)
+
+    # Gemini 프롬프트용 텍스트 (제목만)
     news_text = "[미국 증시 관련 뉴스]\n" + (
-        "\n".join(us_headlines) if us_headlines else "- (수집된 뉴스 없음)"
+        "\n".join(f"- {it['title']}" for it in us_items)
+        if us_items
+        else "- (수집된 뉴스 없음)"
     )
     news_text += "\n\n[한국 증시 관련 뉴스]\n" + (
-        "\n".join(kr_headlines) if kr_headlines else "- (수집된 뉴스 없음)"
+        "\n".join(f"- {it['title']}" for it in kr_items)
+        if kr_items
+        else "- (수집된 뉴스 없음)"
     )
-    return news_text
+
+    return news_text, us_items, kr_items
 
 
 # ------------------------------------------------------------
@@ -100,40 +133,46 @@ def generate_briefing(news_data):
 
 
 # ------------------------------------------------------------
-# 텔레그램 전송
+# 텔레그램 메시지 조립 (HTML)
 # ------------------------------------------------------------
 def _markdown_bold_to_html(text):
-    """Gemini가 만든 **굵게** 표기를 텔레그램 HTML의 <b> 태그로 변환하고,
+    """Gemini가 만든 **굵게** 표기를 텔레그램 HTML <b> 태그로 변환하고,
     나머지 텍스트는 HTML 특수문자를 이스케이프한다."""
-
-    # 1) 먼저 **...** 조각들을 분리해둔다
     parts = re.split(r"(\*\*.*?\*\*)", text, flags=re.DOTALL)
-
     escaped_parts = []
     for part in parts:
         if part.startswith("**") and part.endswith("**") and len(part) >= 4:
-            inner = part[2:-2]
-            inner = (
-                inner.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-            )
+            inner = html.escape(part[2:-2], quote=False)
             escaped_parts.append(f"<b>{inner}</b>")
         else:
-            part = (
-                part.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-            )
-            escaped_parts.append(part)
-
+            escaped_parts.append(html.escape(part, quote=False))
     return "".join(escaped_parts)
 
 
-def send_telegram_message(text):
-    """텔레그램으로 메시지 전송 (HTML 파싱 모드 사용 - Markdown보다 훨씬 안정적)"""
-    html_text = _markdown_bold_to_html(text)
+def _build_links_section(title, items, max_links=4):
+    """뉴스 항목들을 텔레그램 HTML 링크 목록으로 변환"""
+    if not items:
+        return ""
+    lines = [f"\n\n🔗 <b>{html.escape(title, quote=False)}</b>"]
+    for it in items[:max_links]:
+        safe_title = html.escape(it["title"], quote=False)
+        safe_link = html.escape(it["link"], quote=True)
+        lines.append(f'• <a href="{safe_link}">{safe_title}</a>')
+    return "\n".join(lines)
 
+
+def build_final_message(briefing_text, us_items, kr_items):
+    body_html = _markdown_bold_to_html(briefing_text)
+    links_html = _build_links_section("미국 증시 관련 기사", us_items, max_links=4)
+    links_html += _build_links_section("한국 증시 관련 기사", kr_items, max_links=4)
+    return body_html + links_html
+
+
+# ------------------------------------------------------------
+# 텔레그램 전송
+# ------------------------------------------------------------
+def send_telegram_message(html_text, plain_fallback_text):
+    """텔레그램으로 메시지 전송 (HTML 파싱 모드, 실패 시 순수 텍스트로 재시도)"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -146,22 +185,34 @@ def send_telegram_message(text):
 
     try:
         with urllib.request.urlopen(req) as resp:
-            resp_body = resp.read().decode("utf-8")
-            print("텔레그램 전송 성공:", resp_body)
+            print("텔레그램 전송 성공:", resp.read().decode("utf-8"))
+        return
     except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8")
-        print("텔레그램 전송 실패! 응답 내용:", error_body)
-
-        # HTML 파싱마저 실패하면, 서식 없이 순수 텍스트로 최후 재시도
+        print("텔레그램 전송 실패! 응답 내용:", e.read().decode("utf-8"))
         print("서식 없는 일반 텍스트로 재시도합니다...")
-        fallback_payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": re.sub(r"\*\*", "", text),  # ** 만 제거한 원본 텍스트
-        }
-        fallback_data = urllib.parse.urlencode(fallback_payload).encode("utf-8")
-        fallback_req = urllib.request.Request(url, data=fallback_data)
-        with urllib.request.urlopen(fallback_req) as resp2:
-            print("일반 텍스트 재전송 성공:", resp2.read().decode("utf-8"))
+
+    fallback_payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": plain_fallback_text,
+        "disable_web_page_preview": True,
+    }
+    fallback_data = urllib.parse.urlencode(fallback_payload).encode("utf-8")
+    fallback_req = urllib.request.Request(url, data=fallback_data)
+    with urllib.request.urlopen(fallback_req) as resp2:
+        print("일반 텍스트 재전송 성공:", resp2.read().decode("utf-8"))
+
+
+def _build_plain_fallback(briefing_text, us_items, kr_items):
+    plain = re.sub(r"\*\*", "", briefing_text)
+    if us_items:
+        plain += "\n\n[미국 증시 관련 기사]\n" + "\n".join(
+            f"- {it['title']}: {it['link']}" for it in us_items[:4]
+        )
+    if kr_items:
+        plain += "\n\n[한국 증시 관련 기사]\n" + "\n".join(
+            f"- {it['title']}: {it['link']}" for it in kr_items[:4]
+        )
+    return plain
 
 
 # ------------------------------------------------------------
@@ -172,14 +223,18 @@ if __name__ == "__main__":
     check_env()
 
     print("뉴스 수집 중...")
-    news = fetch_latest_news()
-    print(news)
+    news_text, us_items, kr_items = fetch_latest_news()
+    print(news_text)
 
     print("Gemini로 브리핑 생성 중...")
-    briefing = generate_briefing(news)
+    briefing = generate_briefing(news_text)
     print("생성된 브리핑:\n", briefing)
 
+    print("메시지 조립 중...")
+    final_html = build_final_message(briefing, us_items, kr_items)
+    fallback_text = _build_plain_fallback(briefing, us_items, kr_items)
+
     print("텔레그램 전송 중...")
-    send_telegram_message(briefing)
+    send_telegram_message(final_html, fallback_text)
 
     print("완료!")
